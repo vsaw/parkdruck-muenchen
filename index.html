@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <title>Parkdruck - München</title>
+
+    <link rel="shortcut icon" type="image/x-icon" href="docs/images/favicon.ico" />
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.9.0/proj4.js"
+        integrity="sha512-lO8f7sIViqr9x5VE6Q72PS6f4FoZcuh5W9YzeSyfNRJ9z/qL3bkweiwG6keGzWS0BQzNDqAWXdBhYzFD6KffIw=="
+        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script src='https://unpkg.com/@turf/turf@6/turf.min.js'></script>
+
+    <style>
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+        }
+
+        .leaflet-container {
+            height: 100%;
+            width: 100%;
+            max-width: 100%;
+            max-height: 100%;
+        }
+
+        #map {
+            width: 100%;
+            height: 100%;
+        }
+
+        .info {
+            padding: 6px 8px;
+            font: 14px/16px Arial, Helvetica, sans-serif;
+            background: white;
+            background: rgba(255, 255, 255, 0.8);
+            box-shadow: 0 0 15px rgba(0, 0, 0, 0.2);
+            border-radius: 5px;
+        }
+
+        .info h4 {
+            margin: 0 0 5px;
+            color: #777;
+        }
+
+        .legend {
+            text-align: left;
+            line-height: 18px;
+            color: #555;
+        }
+
+        .legend i {
+            width: 18px;
+            height: 18px;
+            float: left;
+            margin-right: 8px;
+            opacity: 0.7;
+        }
+    </style>
+</head>
+
+<body>
+    <div id='map'></div>
+
+    <script type="text/javascript" src="bezirksteile.js"></script>
+    <script type="text/javascript" src="parkseiten.js"></script>
+    <script type="text/javascript" src="parkraum.js"></script>
+    <script type="text/javascript" src="bevölkerung.js"></script>
+    <script type="text/javascript" src="pkw.js"></script>
+    <script type="text/javascript" src="erholungsflächen.js"></script>
+    <script type="text/javascript">
+        /** Converts Coordinates of an entire GeoJSON object to WGS84
+         * 
+         * @param geojson The GeoJSON object with EPSG25832 coordinates
+         * @returns A copy of the GeoJSON object with WGS84 coordinates
+         */
+        function geoJsonToWGS84(geojson) {
+            let ret = { ...geojson };
+            ret.features = geojson.features.filter((feature) => {
+                if(feature.geometry.type !== "Polygon") {
+                    console.warn('Skipping Feature');
+                    console.warn(feature);
+                    return false;
+                }
+                return true;
+            }).map((feature) => {
+                let retFeature = { ...feature };
+                retFeature.geometry.coordinates[0] = feature.geometry.coordinates[0].map(coordsEPSG25832toWGS84);
+                return retFeature;
+            });
+            return ret;
+        }
+
+        /** Convert Coordinates from EPSG25832 to WGS84
+         * 
+         * @param coords The coordinates as Array
+         * @returns Array [lat, long]
+         */ 
+        function coordsEPSG25832toWGS84(coords) {
+            proj4.defs("EPSG:25832", "+proj=utm +zone=32 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs +type=crs");
+            let coordsWgs84 = proj4("EPSG:25832", "WGS84", coords);
+            return coordsWgs84;
+        }
+
+        /** Counts the number of parking spots per Area and adds it to the GeoJSON as feature 
+         * property
+         * 
+         * @param parkraumWGS84 The GeoJSON of parking areas
+         * @param parkseiten The GeoJSON of individual parking spots per street
+         */
+        function addParkingspotCount(parkraumWGS84, parkseiten) {
+            function findByName(parkraumWGS84, name) {
+                return parkraumWGS84.features.find(f => f.properties.name === name);
+            }
+
+            parkseiten.features.forEach(p => {
+                const parkraum = findByName(parkraumWGS84, p.properties.prm_name);
+                if(!parkraum) {
+                    console.warn('Parkarea not found for name ' + p.properties.prm_name);
+                }
+                if(!parkraum.properties.amountParkingSpots) {
+                    parkraum.properties.amountParkingSpots = p.properties.angebot;
+                } else {
+                    parkraum.properties.amountParkingSpots += p.properties.angebot;
+                }
+            });
+        }
+
+        /** Returns the value associated to a BezirksteilNr
+         * 
+         * @param data The data. Must be of type [{ "Räumliche Gliederung": "02.1 Gärtnerplatz", Indikatorwert: 1}, …]
+         * @param nr The nr to look for (with leading 0)
+         * @returns The value under "Indikatorwert" for the "nr"
+         */
+        function findByBezirksteilNr(data, nr) {
+            const ret = data.find(d => {
+                const dnr = d["Räumliche Gliederung"].split(' ')[0];
+                return dnr === nr;
+            });
+            return ret["Indikatorwert"];
+        }
+
+        /** Determines the percentage of areas accesibe for cars in a Bezirksteil and adds it to the
+         * GeoJSON as feature property
+         * 
+         * @param bezirksteileWGS84 GeoJSON with all Bezirksteile
+         * @param erholungsflächen The area not accessible for cars
+         */
+        function addTrafficArea(bezirksteileWGS84, erholungsflächen) {
+            bezirksteileWGS84.features.forEach(t => {
+                const recArea = findByBezirksteilNr(erholungsflächen, t.properties.bt_nummer);
+                t.properties.carAccessibilityPercentage = 1 - Number.parseFloat(recArea) / 100;
+            });
+        }
+
+        /** Counts the number of cars per Bezirksteil and adds it to the GeoJSON as feature property
+         * 
+         * @param bezirksteileWGS84 GeoJSON with all Bezirksteile
+         * @param bevölkerungBezirksteil List with inhabitants per Bezirksteil
+         * @param pkwProStadtbezirksTeil List with number of cars per 1000 people per Bezirksteil
+         */
+        function addCarCountPerBezirksteil(bezirksteileWGS84, bevölkerungBezirksteil, pkwProStadtbezirksTeil) {
+            // Go through each Bezirksteil in the GeoJSON
+            bezirksteileWGS84.features.forEach(t => {
+                // Find the number of people for the Bezirksteil by Nr
+                const people = findByBezirksteilNr(bevölkerungBezirksteil, t.properties.bt_nummer);
+                // Find the number of cars per 1000 people for the Bezirksteil by Nr
+                const carsRatio = findByBezirksteilNr(pkwProStadtbezirksTeil,
+                    t.properties.bt_nummer);
+                // Calculate the number of cars foor the Bezirksteil
+                const cars = people * carsRatio / 1000;
+                // Add the number of cars for each bezirksteil to the GeoJSON
+                t.properties.amountCars = Math.ceil(cars);
+            });
+        }
+
+        /** Calculate the amount of cars per Parkarea and adds it to the GeoJSON as feature property
+         * 
+         * @param parkraumWGS84 The Parkareas as GeoJSON
+         * @param bezirksteileWGS84 The Bezirksteile as GeoJSON
+         * 
+         * Calculate IoU Matrix for each Area with the "Bezirksteil"
+         * Amount of cars in Parkarea += "Amount of Cars in Bezirksteil" * "IoU"
+         */
+        function addCarCount(parkraumWGS84, bezirksteileWGS84) {
+            parkraumWGS84.features.forEach(p => {
+                bezirksteileWGS84.features.forEach(b => {
+                    const intersection = turf.intersect(p, b);
+                    if(intersection === null) {
+                        return;
+                    }
+
+                    // const areaP = turf.area(p);
+                    // const iouOfPinB = intersection !== null ? turf.area(intersection) / areaP : 0;
+
+                    const carsPerSqm = b.properties.amountCars / (turf.area(b) * b.properties.carAccessibilityPercentage);
+
+                    const cars = Math.ceil(carsPerSqm * turf.area(intersection));
+
+                    if(!p.properties.amountCars) {
+                        p.properties.amountCars = cars;
+                    } else {
+                        p.properties.amountCars += cars;
+                    }
+                });
+            });
+        }
+
+        const parkraumWGS84 = geoJsonToWGS84(parkraum);
+        const bezirksteileWGS84 = geoJsonToWGS84(bezirksteile);
+        addParkingspotCount(parkraumWGS84, parkseiten);
+        // Calculate the amount of cars per Bezirksteil
+        addCarCountPerBezirksteil(bezirksteileWGS84, bevölkerungBezirksteil,
+            pkwProStadtbezirksTeil);
+        // Calculate Amount of Cars per Parkarea
+        addTrafficArea(bezirksteileWGS84, erholungsflächen);
+        addCarCount(parkraumWGS84, bezirksteileWGS84);
+
+        var map = L.map('map');        
+
+        var tiles = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '&copy; <a href="http://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+        }).addTo(map);
+
+        const parkraumLayer = L.geoJson(parkraumWGS84, {
+            onEachFeature: (feature, layer) => {
+                layer.bindPopup(`<b>${feature.properties.name}</b><br />
+                    Parkplätze: ${feature.properties.amountParkingSpots}<br />
+                    Pkw: ${feature.properties.amountCars}<br />
+                    Differenz: ${feature.properties.amountCars - feature.properties.amountParkingSpots}<br />
+                    Verhältnis Pkw / Parkplatz: ${ Math.round(feature.properties.amountCars / feature.properties.amountParkingSpots * 100) / 100}`);
+            },
+            style: (feature) => {
+                const carToSpotRatio = Math.round(feature.properties.amountCars / feature.properties.amountParkingSpots * 100) / 100;
+                return {
+                    fillColor: getColor(carToSpotRatio),
+                    weight: 2,
+                    opacity: 1,
+                    color: 'white',
+                    dashArray: '3',
+                    fillOpacity: 0.7,
+                };
+            }
+        }).addTo(map);
+
+        function getColor(d) {
+            return d > 1.75 ? '#d73027' :
+                d > 1.5  ? '#f46d43' :
+                d > 1.25  ? '#fdae61' :
+                d > 1  ? '#fee08b' :
+                d > 0.9   ? '#d9ef8b' :
+                d > 0.8   ? '#a6d96a' :
+                d > 0.7   ? '#66bd63' :
+                            '#1a9850';
+        }
+
+        var legend = L.control({position: 'bottomright'});
+        legend.onAdd = function (map) {
+            var div = L.DomUtil.create('div', 'info legend');
+            const grades = [0.6, 0.7, 0.8, 0.9, 1, 1.25, 1.5, 1.75];
+            const labels = [];
+
+            div.innerHTML += '<b>Verhältnis Pkw / Parkplatz</b><br />';
+            div.innerHTML += '<i style="background:' + getColor(-400) + '"></i> &lt; 0.7 <br>';
+
+            // loop through our density intervals and generate a label with a colored square for each interval
+            for (var i = 1; i < grades.length; i++) {
+                div.innerHTML +=
+                    '<i style="background:' + getColor(grades[i] + 0.01) + '"></i> ' +
+                    grades[i] + (grades[i + 1] !== undefined ? ' &ndash; ' + grades[i + 1] + '<br>' : '+');
+            }
+
+            return div;
+        };
+        legend.addTo(map);
+
+        var info = L.control({position: 'topright'});
+        info.onAdd = function (map) {
+            var div = L.DomUtil.create('div', 'info');
+            div.id = "info"
+            const grades = [0.6, 0.7, 0.8, 0.9, 1, 1.25, 1.5, 1.75];
+            const labels = [];
+
+            div.style = ""
+            div.innerHTML += `<h1 style="line-height: 2rem;">Wie viele private Pkw kommen auf einen öffentlichen Parkplatz?</h1>
+                <p>
+                    Diese Karte wertet Daten des <a href="https://geoportal.muenchen.de">GeoPortal München</a>
+                    und <a href="https://www.mstatistik-muenchen.de/indikatorenatlas/atlas.html?indicator=i51&date=2022">Indikatorenatlas München</a>
+                    aus um die oben stehende Frage zu beantworten. Dies soll helfen 
+                    <a href="https://www.zdf.de/nachrichten/panorama/verkehrswende-klima-muenchen-kolumbusstrasse-100.html">"Parkplatzdiskussion"</a>,
+                    wie z.B. zum Pilotprojekt "Autoreduzierte Quartiere für eine lebenswerte Stadt"
+                    in der Kolumbusstr ins Verhältniss zu rücken.
+                </p>
+                <b>Woher kommen die Daten?</b>
+                <p>
+                    Die Anzahl der öffentlichen Parkplätze pro Parkgebiet kann anhand der
+                    <i>Parkseiten</i> direkt ermittelt werden. Leider gibt es auch keine Zahlen zu
+                    den ausgegebenen Parkausweisen für Parkgebiete, daher wurde die Anzahl der PKW
+                    pro Parkgebiet näherungsweise ermittelt aus den <i>Bevölkerungszahlen</i> und
+                    dem <i>Motorisierungsgrad</i>.
+                <p>
+                <p>
+                    Hinweis: Für private Abstellflächen sind mir leider keine Daten bekannt. Es werden auch
+                    nur privat gemeldete Pkw berücksichtigt, da für Dienstwägen und andere
+                    gewerbliche Fahrzeuge nur rückschlüsse auf die "Zulassung", nicht jedoch auf den
+                    Abstellort gezogen werden kann. Daher können Abweichungen von der tatsächlichen
+                    Situation vor Ort abweichen, es wird jedoch vermutet dass die Tendenzen stimmen.
+                </p>
+                <a href="#" onClick="L.DomUtil.remove(L.DomUtil.get('info'))">Infobox Schließen</a>`;
+
+            return div;
+        };
+        info.addTo(map);
+
+        map.fitBounds(parkraumLayer.getBounds());
+    </script>
+</body>
+
+</html>
